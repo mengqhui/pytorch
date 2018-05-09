@@ -9,7 +9,7 @@ class Module(object):
         self.gradInput = torch.Tensor()
         self.output = torch.Tensor()
         self._type = self.output.type()
-        self._backend = torch._thnn.type2backend[type(self.output)]
+        self._backend = torch._thnn.type2backend[self.output.type()]
 
     def __repr__(self):
         return 'nn.' + self.__class__.__name__
@@ -76,10 +76,11 @@ class Module(object):
                 grad.zero_()
 
     def updateParameters(self, learningRate):
-        params, gradParams = self.parameters()
-        if params:
-            for p, gp in zip(params, gradParams):
-                p.add_(-learningRate, gp)
+        if self.parameters() is not None:
+            params, gradParams = self.parameters()
+            if params:
+                for p, gp in zip(params, gradParams):
+                    p.add_(-learningRate, gp)
 
     def training(self):
         self.train = True

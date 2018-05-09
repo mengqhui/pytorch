@@ -28,9 +28,10 @@ class WeightedMSECriterion(Criterion):
             input,
             self.buffer,
             self.output_tensor,
-            self.sizeAverage
+            self.sizeAverage,
+            True,  # reduce
         )
-        self.output = self.output_tensor[0]
+        self.output = self.output_tensor[0].item()
         return self.output
 
     def updateGradInput(self, input, target):
@@ -41,11 +42,15 @@ class WeightedMSECriterion(Criterion):
         else:
             self.buffer.mul_(self.weight)
 
+        implicit_gradOutput = torch.Tensor([1]).type(input.type())
+
         self._backend.MSECriterion_updateGradInput(
             self._backend.library_state,
             input,
             self.buffer,
+            implicit_gradOutput,
             self.gradInput,
-            self.sizeAverage
+            self.sizeAverage,
+            True,  # reduce
         )
         return self.gradInput

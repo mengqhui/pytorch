@@ -1,6 +1,7 @@
-#include <Python.h>
+#include "torch/csrc/python_headers.h"
 
-#include "THP.h"
+#include "allocators.h"
+#include "torch/csrc/utils/auto_gil.h"
 
 // Adapted from fblualib
 void* ObjectPtrAllocator::malloc(ptrdiff_t size) {
@@ -13,43 +14,23 @@ void* ObjectPtrAllocator::realloc(void* ptr, ptrdiff_t size) {
 }
 
 void ObjectPtrAllocator::free(void* ptr) {
-  object = nullptr;
+  {
+    AutoGIL gil;
+    object = nullptr;
+  }
   allocator->free(allocatorContext, ptr);
   delete this;
 }
 
 void StorageWeakRefAllocator::free(void* ptr) {
-  PyGILState_STATE gstate = PyGILState_Ensure();
-  PyObject_SetAttrString(object.get(), "cdata", Py_None);
-  object = nullptr;
-  PyGILState_Release(gstate);
+  {
+    AutoGIL gil;
+    PyObject_SetAttrString(object.get(), "cdata", Py_None);
+    object = nullptr;
+  }
   allocator->free(allocatorContext, ptr);
   delete this;
 }
-
-
-#ifdef WITH_NUMPY
-void* NumpyArrayAllocator::realloc(void* ptr, ptrdiff_t size) {
-  PyArrayObject *array_ptr = (PyArrayObject*)object.get();
-  if (array_ptr && ptr == PyArray_DATA(array_ptr)) {
-    void* newPtr = this->malloc(size);
-    memcpy(newPtr, ptr, std::min(size, PyArray_NBYTES(array_ptr)));
-    // Whee! We're done!
-    object = nullptr;
-    return newPtr;
-  }
-  return allocator->realloc(allocatorContext, ptr, size);
-}
-
-
-void NumpyArrayAllocator::free(void* ptr) {
-  PyArrayObject *array_ptr = (PyArrayObject*)object.get();
-  if (!array_ptr || ptr != PyArray_DATA(array_ptr))
-    throw std::logic_error("invalid call to NumpyArrayAllocator::free()");
-  object = nullptr;
-  delete this;
-}
-#endif
 
 template<typename T>
 static void * malloc_wrapper(void *ctx, ptrdiff_t size) {
@@ -78,14 +59,6 @@ THAllocator THStorageWeakRefAllocator = {
   free_wrapper<StorageWeakRefAllocator>,
 };
 
-#ifdef WITH_NUMPY
-THAllocator THNumpyArrayAllocator = {
-  malloc_wrapper<NumpyArrayAllocator>,
-  realloc_wrapper<NumpyArrayAllocator>,
-  free_wrapper<NumpyArrayAllocator>,
-};
-#endif
-
 #ifdef WITH_CUDA
 cudaError_t CudaStorageWeakRefAllocator::malloc(void** ptr, size_t size, cudaStream_t stream) {
   THError("CudaStorageWeakRefAllocator: malloc not supported");
@@ -93,10 +66,11 @@ cudaError_t CudaStorageWeakRefAllocator::malloc(void** ptr, size_t size, cudaStr
 }
 
 cudaError_t CudaStorageWeakRefAllocator::free(void* ptr) {
-  PyGILState_STATE gstate = PyGILState_Ensure();
-  PyObject_SetAttrString(object.get(), "cdata", Py_None);
-  object = nullptr;
-  PyGILState_Release(gstate);
+  {
+    AutoGIL gil;
+    PyObject_SetAttrString(object.get(), "cdata", Py_None);
+    object = nullptr;
+  }
   cudaError_t err = allocator->free(allocatorContext, ptr);
   delete this;
   return err;

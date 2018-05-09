@@ -66,7 +66,7 @@ static PyObject * THPStorage_(resize_)(THPStorage *self, PyObject *number_arg)
   HANDLE_TH_ERRORS
   THPUtils_assert(THPUtils_checkLong(number_arg), "resize_ expects an int, "
       "but got %s", THPUtils_typename(number_arg));
-  long newsize = THPUtils_unpackLong(number_arg);
+  int64_t newsize = THPUtils_unpackLong(number_arg);
   THStorage_(resize)(LIBRARY_STATE self->cdata, newsize);
   Py_INCREF(self);
   return (PyObject*)self;
@@ -127,16 +127,16 @@ static PyObject * THPStorage_(fromBuffer)(PyObject *_unused, PyObject *args, PyO
 
   if (offset < 0 || offset > buffer.len) {
     PyErr_Format(PyExc_ValueError,
-      "offset must be non-negative and no greater than buffer length (%ld), "
-      "but got %ld", (long)offset, (long)buffer.len);
+      "offset must be non-negative and no greater than buffer length (%" PRId64 "), "
+      "but got %" PRId64, (int64_t)offset, (int64_t)buffer.len);
     PyBuffer_Release(&buffer);
     return NULL;
   }
 
   if (count < 0) {
     if ((buffer.len - offset) % sizeof(real) != 0) {
-      PyErr_Format(PyExc_ValueError, "buffer size (%ld) must be a multiple "
-          "of element size (%ld)", (long)buffer.len, (long)sizeof(real));
+      PyErr_Format(PyExc_ValueError, "buffer size (%" PRId64 ") must be a multiple "
+          "of element size (%" PRId64 ")", (int64_t)buffer.len, (int64_t)sizeof(real));
       PyBuffer_Release(&buffer);
       return NULL;
     }
@@ -144,9 +144,9 @@ static PyObject * THPStorage_(fromBuffer)(PyObject *_unused, PyObject *args, PyO
   }
 
   if (offset + (count * (Py_ssize_t)sizeof(real)) > buffer.len) {
-    PyErr_Format(PyExc_ValueError, "buffer has only %ld elements after offset "
-        "%ld, but specified a size of %ld", (long)(buffer.len - offset),
-        (long)offset, (long)count);
+    PyErr_Format(PyExc_ValueError, "buffer has only %" PRId64 " elements after offset "
+        "%" PRId64 ", but specified a size of %" PRId64, (int64_t)(buffer.len - offset),
+        (int64_t)offset, (int64_t)count);
     PyBuffer_Release(&buffer);
     return NULL;
   }
@@ -198,9 +198,17 @@ static PyObject * THPStorage_(fromFile)(PyObject *_unused, PyObject *args, PyObj
 }
 
 #ifndef THD_GENERIC_FILE
-PyObject * THPStorage_(writeFile)(THPStorage *self, PyObject *file)
+PyObject * THPStorage_(writeFile)(THPStorage *self, PyObject *args)
 {
   HANDLE_TH_ERRORS
+  PyObject *file = PyTuple_GET_ITEM(args, 0);
+  bool is_real_file = PyTuple_GET_ITEM(args, 1) == Py_True;
+
+  if (!is_real_file) {
+    THPStorage_(writeFileRaw<PyObject*>)(self->cdata, file);
+    Py_RETURN_NONE;
+  }
+
   int fd = PyObject_AsFileDescriptor(file);
   THPUtils_assert(fd != -1, "_write_file couldn't retrieve a file descriptor "
       "from given object");
@@ -215,7 +223,7 @@ PyObject * THPStorage_(newWithFile)(PyObject *_unused, PyObject *file)
   int fd = PyObject_AsFileDescriptor(file);
   THPUtils_assert(fd != -1, "_new_with_file couldn't retrieve a file "
       "descriptor from given object");
-  THStorage *storage = THPStorage_(readFileRaw)(fd, nullptr);
+  THStorage *storage = THPStorage_(readFileRaw<int>)(fd, nullptr);
   if (storage == nullptr)
     return nullptr;
   PyObject *result = THPStorage_(New)(storage);
@@ -227,16 +235,30 @@ static PyObject *THPStorage_(setFromFile)(THPStorage *self, PyObject *args)
 {
   HANDLE_TH_ERRORS
   PyObject *file = PyTuple_GET_ITEM(args, 0);
-  int fd = PyObject_AsFileDescriptor(file);
-
   PyObject *offset = PyTuple_GET_ITEM(args, 1);
+  bool is_real_file = PyTuple_GET_ITEM(args, 2) == Py_True;
+
+  if (!is_real_file) {
+    // offset can be implemented with a call to the Python object's seek()
+    // but it is currently unnecessary to support this.
+    THPUtils_assert(offset == Py_None,
+                    "_set_from_file: offset is NYI for filelike objects");
+    THStorage *storage = THPStorage_(readFileRaw<PyObject*>)(file, self->cdata);
+    if (storage == nullptr) {
+      return nullptr;
+    }
+    Py_INCREF(self);
+    return (PyObject *) self;
+  }
+
+  // file is backed by a fd
+  int fd = PyObject_AsFileDescriptor(file);
   if (offset != Py_None) {
     lseek(fd, THPUtils_unpackLong(offset), SEEK_SET);
   }
-
   THPUtils_assert(fd != -1, "_set_from_file couldn't retrieve a file "
       "descriptor from given object");
-  THStorage *storage = THPStorage_(readFileRaw)(fd, self->cdata);
+  THStorage *storage = THPStorage_(readFileRaw<int>)(fd, self->cdata);
   if (storage == nullptr)
     return nullptr;
   Py_INCREF(self);
@@ -300,7 +322,7 @@ static PyMethodDef THPStorage_(methods)[] = {
 #ifndef THD_GENERIC_FILE
   {"data_ptr", (PyCFunction)THPStorage_(dataPtr), METH_NOARGS, NULL},
   {"is_pinned", (PyCFunction)THPStorage_(isPinned), METH_NOARGS, NULL},
-  {"_write_file", (PyCFunction)THPStorage_(writeFile), METH_O, NULL},
+  {"_write_file", (PyCFunction)THPStorage_(writeFile), METH_VARARGS, NULL},
   {"_new_with_file", (PyCFunction)THPStorage_(newWithFile), METH_O | METH_STATIC, NULL},
   {"_set_from_file", (PyCFunction)THPStorage_(setFromFile), METH_VARARGS, NULL},
 #endif // !defined(THD_GENERIC_FILE)

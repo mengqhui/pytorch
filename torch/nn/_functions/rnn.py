@@ -1,7 +1,10 @@
-from torch.autograd import Function, NestedIOFunction, Variable
+import warnings
+from torch.autograd import NestedIOFunction
 import torch.backends.cudnn as cudnn
 from .. import functional as F
 from .thnn import rnnFusedPointwise as fusedBackend
+import itertools
+from functools import partial
 
 try:
     import torch.backends.cudnn.rnn
@@ -23,7 +26,7 @@ def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
     if input.is_cuda:
         igates = F.linear(input, w_ih)
         hgates = F.linear(hidden[0], w_hh)
-        state = fusedBackend.LSTMFused()
+        state = fusedBackend.LSTMFused.apply
         return state(igates, hgates, hidden[1]) if b_ih is None else state(igates, hgates, hidden[1], b_ih, b_hh)
 
     hx, cx = hidden
@@ -47,7 +50,7 @@ def GRUCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
     if input.is_cuda:
         gi = F.linear(input, w_ih)
         gh = F.linear(hidden, w_hh)
-        state = fusedBackend.GRUFused()
+        state = fusedBackend.GRUFused.apply
         return state(gi, gh, hidden) if b_ih is None else state(gi, gh, hidden, b_ih, b_hh)
 
     gi = F.linear(input, w_ih, b_ih)
@@ -68,7 +71,7 @@ def StackedRNN(inners, num_layers, lstm=False, dropout=0, train=True):
     num_directions = len(inners)
     total_layers = num_layers * num_directions
 
-    def forward(input, hidden, weight):
+    def forward(input, hidden, weight, batch_sizes):
         assert(len(weight) == total_layers)
         next_hidden = []
 
@@ -80,7 +83,7 @@ def StackedRNN(inners, num_layers, lstm=False, dropout=0, train=True):
             for j, inner in enumerate(inners):
                 l = i * num_directions + j
 
-                hy, output = inner(input, hidden[l], weight[l])
+                hy, output = inner(input, hidden[l], weight[l], batch_sizes)
                 next_hidden.append(hy)
                 all_output.append(output)
 
@@ -105,7 +108,7 @@ def StackedRNN(inners, num_layers, lstm=False, dropout=0, train=True):
 
 
 def Recurrent(inner, reverse=False):
-    def forward(input, hidden, weight):
+    def forward(input, hidden, weight, batch_sizes):
         output = []
         steps = range(input.size(0) - 1, -1, -1) if reverse else range(input.size(0))
         for i in steps:
@@ -122,17 +125,16 @@ def Recurrent(inner, reverse=False):
     return forward
 
 
-def variable_recurrent_factory(batch_sizes):
-    def fac(inner, reverse=False):
-        if reverse:
-            return VariableRecurrentReverse(batch_sizes, inner)
-        else:
-            return VariableRecurrent(batch_sizes, inner)
-    return fac
+def variable_recurrent_factory(inner, reverse=False):
+    if reverse:
+        return VariableRecurrentReverse(inner)
+    else:
+        return VariableRecurrent(inner)
 
 
-def VariableRecurrent(batch_sizes, inner):
-    def forward(input, hidden, weight):
+def VariableRecurrent(inner):
+    def forward(input, hidden, weight, batch_sizes):
+
         output = []
         input_offset = 0
         last_batch_size = batch_sizes[0]
@@ -170,8 +172,8 @@ def VariableRecurrent(batch_sizes, inner):
     return forward
 
 
-def VariableRecurrentReverse(batch_sizes, inner):
-    def forward(input, hidden, weight):
+def VariableRecurrentReverse(inner):
+    def forward(input, hidden, weight, batch_sizes):
         output = []
         input_offset = input.size(0)
         last_batch_size = batch_sizes[-1]
@@ -181,7 +183,8 @@ def VariableRecurrentReverse(batch_sizes, inner):
             hidden = (hidden,)
             initial_hidden = (initial_hidden,)
         hidden = tuple(h[:batch_sizes[-1]] for h in hidden)
-        for batch_size in reversed(batch_sizes):
+        for i in reversed(range(len(batch_sizes))):
+            batch_size = batch_sizes[i]
             inc = batch_size - last_batch_size
             if inc > 0:
                 hidden = tuple(torch.cat((h, ih[last_batch_size:batch_size]), 0)
@@ -206,8 +209,8 @@ def VariableRecurrentReverse(batch_sizes, inner):
 
 
 def AutogradRNN(mode, input_size, hidden_size, num_layers=1, batch_first=False,
-                dropout=0, train=True, bidirectional=False, batch_sizes=None,
-                dropout_state=None):
+                dropout=0, train=True, bidirectional=False, variable_length=False,
+                dropout_state=None, flat_weight=None):
 
     if mode == 'RNN_RELU':
         cell = RNNReLUCell
@@ -220,10 +223,7 @@ def AutogradRNN(mode, input_size, hidden_size, num_layers=1, batch_first=False,
     else:
         raise Exception('Unknown mode: {}'.format(mode))
 
-    if batch_sizes is None:
-        rec_factory = Recurrent
-    else:
-        rec_factory = variable_recurrent_factory(batch_sizes)
+    rec_factory = variable_recurrent_factory if variable_length else Recurrent
 
     if bidirectional:
         layer = (rec_factory(cell), rec_factory(cell, reverse=True))
@@ -236,13 +236,13 @@ def AutogradRNN(mode, input_size, hidden_size, num_layers=1, batch_first=False,
                       dropout=dropout,
                       train=train)
 
-    def forward(input, weight, hidden):
-        if batch_first and batch_sizes is None:
+    def forward(input, weight, hidden, batch_sizes):
+        if batch_first and not variable_length:
             input = input.transpose(0, 1)
 
-        nexth, output = func(input, hidden, weight)
+        nexth, output = func(input, hidden, weight, batch_sizes)
 
-        if batch_first and batch_sizes is None:
+        if batch_first and not variable_length:
             output = output.transpose(0, 1)
 
         return output, nexth
@@ -250,96 +250,76 @@ def AutogradRNN(mode, input_size, hidden_size, num_layers=1, batch_first=False,
     return forward
 
 
-class CudnnRNN(NestedIOFunction):
+def CudnnRNN(mode, input_size, hidden_size, num_layers=1,
+             batch_first=False, dropout=0, train=True, bidirectional=False,
+             variable_length=False, dropout_state=None, flat_weight=None):
+    if dropout_state is None:
+        dropout_state = {}
+    mode = cudnn.rnn.get_cudnn_mode(mode)
+    # TODO: This is really goofy way of using the Torch RNG to get a random number
+    dropout_seed = int(torch.IntTensor(1).random_())
+    if flat_weight is None:
+        warnings.warn("RNN module weights are not part of single contiguous "
+                      "chunk of memory. This means they need to be compacted "
+                      "at every call, possibly greatly increasing memory usage. "
+                      "To compact weights again call flatten_parameters().", stacklevel=5)
 
-    def __init__(self, mode, input_size, hidden_size, num_layers=1,
-                 batch_first=False, dropout=0, train=True, bidirectional=False,
-                 batch_sizes=None, dropout_state=None):
-        super(CudnnRNN, self).__init__()
-        if dropout_state is None:
-            dropout_state = {}
-        self.mode = cudnn.rnn.get_cudnn_mode(mode)
-        self.input_mode = cudnn.CUDNN_LINEAR_INPUT
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.batch_first = batch_first
-        self.dropout = dropout
-        self.train = train
-        self.bidirectional = 1 if bidirectional else 0
-        self.num_directions = 2 if bidirectional else 1
-        self.batch_sizes = batch_sizes
-        self.dropout_seed = torch.IntTensor(1).random_()[0]
-        self.dropout_state = dropout_state
-
-    def forward_extended(self, input, weight, hx):
-        assert cudnn.is_acceptable(input)
-
-        output = input.new()
-
-        if torch.is_tensor(hx):
-            hy = hx.new()
+    def forward(input, weight, hx, batch_sizes):
+        if mode == cudnn.CUDNN_LSTM:
+            hx, cx = hx
         else:
-            hy = tuple(h.new() for h in hx)
+            cx = None
 
-        cudnn.rnn.forward(self, input, hx, weight, output, hy)
+        handle = cudnn.get_handle()
+        dropout_ts = cudnn.rnn.init_dropout_state(torch.uint8, torch.device('cuda'), dropout,
+                                                  train, dropout_seed, dropout_state)
 
-        self.save_for_backward(input, hx, weight, output)
-        return output, hy
+        weight_arr = list(itertools.chain.from_iterable(weight))
+        weight_stride0 = len(weight[0])
 
-    def backward_extended(self, grad_output, grad_hy):
-        input, hx, weight, output = self.saved_tensors
-        input = input.contiguous()
+        output, hy, cy, reserve, new_weight_buf = torch._cudnn_rnn(
+            input, weight_arr, weight_stride0,
+            flat_weight,
+            hx, cx,
+            mode, hidden_size, num_layers,
+            batch_first, dropout, train, bool(bidirectional),
+            list(batch_sizes.data) if variable_length else (),
+            dropout_ts)
 
-        grad_input, grad_weight, grad_hx = None, None, None
-
-        assert cudnn.is_acceptable(input)
-
-        grad_input = input.new()
-        if torch.is_tensor(hx):
-            grad_hx = input.new()
+        if cx is not None:
+            return (output, (hy, cy))
         else:
-            grad_hx = tuple(h.new() for h in hx)
+            return (output, hy)
 
-        if self.retain_variables:
-            self._reserve_clone = self.reserve.clone()
-
-        cudnn.rnn.backward_grad(
-            self,
-            input,
-            hx,
-            weight,
-            output,
-            grad_output,
-            grad_hy,
-            grad_input,
-            grad_hx)
-
-        if any(self.needs_input_grad[1:]):
-            grad_weight = [tuple(w.new().resize_as_(w) for w in layer_weight) for layer_weight in weight]
-            cudnn.rnn.backward_weight(
-                self,
-                input,
-                hx,
-                output,
-                weight,
-                grad_weight)
-        else:
-            grad_weight = [(None,) * len(layer_weight) for layer_weight in weight]
-
-        if self.retain_variables:
-            self.reserve = self._reserve_clone
-            del self._reserve_clone
-
-        return grad_input, grad_weight, grad_hx
+    return forward
 
 
 def RNN(*args, **kwargs):
+
     def forward(input, *fargs, **fkwargs):
         if cudnn.is_acceptable(input.data):
             func = CudnnRNN(*args, **kwargs)
         else:
             func = AutogradRNN(*args, **kwargs)
+
+        # Hack for the tracer that allows us to represent RNNs as single
+        # nodes and export them to ONNX in this form
+        # Check the first argument explicitly to reduce the overhead of creating
+        # the lambda. We need special handling here because the forward()
+        # function gets reconstructed each and every time when RNN() is invoked
+        # and we don't want to pay the cost of decorator invocation
+        import torch
+        if torch._C._jit_is_tracing(input):
+            import torch.onnx.symbolic
+            sym = torch.onnx.symbolic.RNN_symbolic_builder(*args, **kwargs)
+            cell_type = args[0]
+
+            bound_symbolic = partial(torch.onnx.symbolic.rnn_trace_override_symbolic,
+                                     cell_type, func, sym)
+
+            decorator = torch.onnx.symbolic_override_first_arg_based(bound_symbolic)
+            func = decorator(func)
+
         return func(input, *fargs, **fkwargs)
 
     return forward

@@ -1,75 +1,35 @@
 #pragma once
 
-#include <Python.h>
-#include <THPP/THPP.h>
-#include <memory>
-
 #include "torch/csrc/autograd/function.h"
 #include "torch/csrc/autograd/variable.h"
 
+#include "ATen/Type.h"
+#include <ATen/TensorGeometry.h>
+
+#include <cstdint>
+#include <memory>
+
 namespace torch { namespace autograd {
 
-struct Identity : public Function {
-  Identity(FunctionFlags&& f)
-    : Function(std::move(f)) {};
-
+struct CopyBackwards : public Function {
   virtual variable_list apply(const variable_list& inputs) override;
+
+  at::Type *src_type;
+  int64_t src_device;
 };
 
-struct Clone : public Function {
-  Clone() {}
+// Performs grad[idx] = fn(grad[idx]), but out-of-place. The slicing operation
+// grad[idx] is defined by the relative sizes, strides, and offset of base and
+// view.
+struct CopySlices : public Function {
+  CopySlices(const Variable& base, at::TensorGeometry view, std::shared_ptr<Function> fn);
 
-  virtual variable_list apply(const variable_list& inputs) override;
-};
+  virtual variable_list apply(const variable_list& grads) override;
+  virtual void release_variables() override;
 
-struct Contiguous : public Function {
-  Contiguous() {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-};
-
-struct Transpose : public Function {
-  Transpose(long dim1, long dim2)
-    : dim1(dim1)
-    , dim2(dim2) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  long dim1;
-  long dim2;
-};
-
-struct View : public Function {
-  View(std::vector<long> size)
-    : size(size) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  std::vector<long> size;
-};
-
-struct Expand : public Function {
-  Expand(std::vector<long> size)
-    : size(size) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  std::vector<long> size;
-};
-
-struct Narrow : public Function {
-  Narrow(long dim, long start, long size)
-    : dim(dim)
-    , start(start)
-    , size(size) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  long dim;
-  long start;
-  long size;
+  at::TensorGeometry base;
+  at::TensorGeometry view;
+  std::shared_ptr<Function> fn;
 };
 
 }}
-
-

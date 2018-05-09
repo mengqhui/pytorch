@@ -18,48 +18,78 @@ FUNCTION(EXCLUDE_DIR list_name dir_name)
 ENDFUNCTION()
 
 ################################################################################
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+
+INCLUDE(CheckCXXSourceCompiles)
+
+CHECK_CXX_SOURCE_COMPILES("
+#include <thread>
+
+thread_local int foo=1;
+
+int main() {
+  return 0;
+}" HAS_THREAD_LOCAL)
+
+IF(NOT HAS_THREAD_LOCAL)
+    MESSAGE(FATAL_ERROR "thread_local not supported. THD requires a compiler"
+                        " that supports thread_local. Please upgrade your "
+                        "compiler. If you are on macOS, upgrade to "
+                        "XCode 8 or newer.")
+ENDIF(NOT HAS_THREAD_LOCAL)
+
+FIND_PACKAGE(NCCL)
 
 FIND_PACKAGE(MPI)
 
 FIND_PACKAGE(Gloo)
 
-IF(NOT Torch_FOUND)
-  FIND_PACKAGE(Torch REQUIRED)
-ENDIF()
-
-IF(NOT TH_LIBRARIES)
-  SET(TH_LIBRARIES "TH")
-ENDIF(NOT TH_LIBRARIES)
-MESSAGE(STATUS "TH_LIBRARIES: ${TH_LIBRARIES}")
-
-IF(NOT THPP_LIBRARIES)
-  SET(THPP_LIBRARIES "THPP")
-ENDIF(NOT THPP_LIBRARIES)
-MESSAGE(STATUS "THPP_LIBRARIES: ${THPP_LIBRARIES}")
+FIND_PACKAGE(ATen REQUIRED)
+INCLUDE_DIRECTORIES(${ATEN_INCLUDE_DIR})
 
 IF(NO_CUDA)
   MESSAGE(STATUS "ignoring CUDA")
 ELSE()
-  FIND_PACKAGE(CUDA 5.5)
+  FIND_PACKAGE(CUDA 7.5)
   IF(CUDA_FOUND)
     INCLUDE_DIRECTORIES(${CUDA_INCLUDE_DIRS})
-    INCLUDE_DIRECTORIES("${CUDA_SDK_ROOT_DIR}/common/inc")
     LINK_DIRECTORIES("${CUDA_TOOLKIT_ROOT_DIR}/lib" "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
 
-    IF(NOT THC_LIBRARIES)
-      SET(THC_LIBRARIES "THC")
-    ENDIF(NOT THC_LIBRARIES)
-    MESSAGE(STATUS "THC_LIBRARIES: ${THC_LIBRARIES}")
     ADD_DEFINITIONS(-DWITH_CUDA=1)
   ENDIF()
 ENDIF()
 
 IF(MPI_FOUND)
   ADD_DEFINITIONS(-DWITH_MPI=1)
+  MESSAGE(STATUS "MPI_LIBRARIES: ${MPI_LIBRARIES}")
 ENDIF()
 
 IF(GLOO_FOUND)
   ADD_DEFINITIONS(-DWITH_GLOO=1)
+  MESSAGE(STATUS "Found Gloo, will compile with Gloo distributed backend")
+  IF(WITH_GLOO_IBVERBS)
+    MESSAGE(STATUS "Building the gloo backend with both TCP and infiniband support")
+    ADD_DEFINITIONS(-DWITH_GLOO_IBVERBS=1)
+  ELSE()
+    MESSAGE(STATUS "Building the gloo backend with TCP support only")
+  ENDIF()
+ENDIF()
+
+IF(NCCL_FOUND)
+  MESSAGE(STATUS "NCCL_LIBRARIES: ${NCCL_LIBRARIES}")
+  IF(NCCL_MAJOR_VERSION AND NOT (NCCL_MAJOR_VERSION LESS 2))
+    MESSAGE(STATUS "NCCL Version 2 or higher found, will "
+                   "compile with NCCL distributed backend")
+    SET(DISTRIBUTED_NCCL_FOUND TRUE)
+    ADD_DEFINITIONS(-DWITH_DISTRIBUTED_NCCL=1)
+  ELSE()
+    MESSAGE(STATUS "Found NCCL, but the NCCL version is either not 2+ or not "
+                   "determinable, will not compile with NCCL distributed "
+                   "backend")
+  ENDIF()
+ELSE()
+  MESSAGE(STATUS "Not able to find NCCL, will not "
+                 "compile with NCCL distributed backend")
 ENDIF()
 
 ADD_DEFINITIONS(-D_THD_CORE=1)
@@ -91,46 +121,54 @@ IF(NOT GLOO_FOUND)
   LIST(REMOVE_ITEM test_cpp "${CMAKE_CURRENT_SOURCE_DIR}/test/data_channel_gloo_cache.cpp")
 ENDIF()
 
+IF(NOT DISTRIBUTED_NCCL_FOUND)
+  LIST(REMOVE_ITEM base_cpp "${CMAKE_CURRENT_SOURCE_DIR}/base/data_channels/DataChannelNccl.cpp")
+ENDIF()
+
 EXCLUDE_DIR(master_worker_cpp ".*/dispatch/.*\\.cpp$")
 
-SET(all_cpp ${base_cpp} ${process_group_cpp} ${master_worker_cpp})
-SET(all_h THD.h ${base_h} ${process_group_h} ${master_worker_h})
+SET(all_cpp ${base_cpp} ${process_group_cpp})
+SET(all_h THD.h ${base_h} ${process_group_h})
+
+IF(WITH_DISTRIBUTED_MW)
+  ADD_DEFINITIONS(-DWITH_DISTRIBUTED_MW=1)
+  SET(all_cpp ${all_cpp} ${master_worker_cpp})
+  SET(all_h THD.h ${all_h} ${master_worker_h})
+ENDIF()
 
 EXCLUDE_DIR(all_cpp ".*/generic/.*\\.cpp$")
 
+# Need to include external NCCL first
+IF(DISTRIBUTED_NCCL_FOUND)
+  INCLUDE_DIRECTORIES(${NCCL_INCLUDE_DIR})
+  FILE(APPEND "${CMAKE_INSTALL_PREFIX}/THD_deps.txt" "${NCCL_LIBRARIES};")
+ENDIF()
+
 INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR})
 
-ADD_LIBRARY(THD SHARED ${all_cpp})
-SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+ADD_LIBRARY(THD STATIC ${all_cpp})
+set_property(TARGET THD PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-IF(THD_SO_VERSION)
-  MESSAGE(STATUS "THD_SO_VERSION: ${THD_SO_VERSION}")
-  SET_TARGET_PROPERTIES(THD PROPERTIES
-    VERSION   ${THD_SO_VERSION}
-    SOVERSION ${THD_SO_VERSION})
-ENDIF(THD_SO_VERSION)
-
-TARGET_LINK_LIBRARIES(THD LINK_PRIVATE ${TH_LIBRARIES} ${THPP_LIBRARIES})
-IF(CUDA_FOUND)
-  TARGET_LINK_LIBRARIES(THD LINK_PRIVATE ${THC_LIBRARIES})
-ENDIF()
+FILE(WRITE "${CMAKE_INSTALL_PREFIX}/THD_deps.txt" "${ATEN_LIBRARIES};")
 
 IF(MPI_FOUND)
   INCLUDE_DIRECTORIES(${MPI_INCLUDE_PATH})
-  TARGET_LINK_LIBRARIES(THD LINK_PRIVATE ${MPI_LIBRARIES})
+  FILE(APPEND "${CMAKE_INSTALL_PREFIX}/THD_deps.txt" "${MPI_LIBRARIES};")
 
   IF(MPI_COMPILE_FLAGS)
+    MESSAGE(STATUS "MPI_COMPILE_FLAGS: ${MPI_COMPILE_FLAGS}")
     SET_TARGET_PROPERTIES(THD PROPERTIES COMPILE_FLAGS "${MPI_COMPILE_FLAGS}")
   ENDIF()
 
   IF(MPI_LINK_FLAGS)
+    MESSAGE(STATUS "MPI_LINK_FLAGS: ${MPI_LINK_FLAGS}")
     SET_TARGET_PROPERTIES(THD PROPERTIES LINK_FLAGS "${MPI_LINK_FLAGS}")
   ENDIF()
 ENDIF()
 
 IF(GLOO_FOUND)
   INCLUDE_DIRECTORIES(${GLOO_INCLUDE_DIR})
-  TARGET_LINK_LIBRARIES(THD LINK_PRIVATE ${GLOO_LIBRARIES})
+  FILE(APPEND "${CMAKE_INSTALL_PREFIX}/THD_deps.txt" "${GLOO_LIBRARIES};")
 ENDIF()
 
 # Test executables
@@ -144,7 +182,7 @@ IF(THD_WITH_TESTS)
     SET(test_executable_name "test_${test_name}")
 
     ADD_EXECUTABLE(${test_executable_name} "test/${test_source_file}")
-    TARGET_LINK_LIBRARIES(${test_executable_name} THD ${TH_LIBRARIES} ${THPP_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+    TARGET_LINK_LIBRARIES(${test_executable_name} THD ${ATEN_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
     SET_PROPERTY(TARGET ${test_executable_name} PROPERTY CXX_STANDARD 11)
     ADD_TEST(${test_name} ${test_executable_name})
   ENDFOREACH()

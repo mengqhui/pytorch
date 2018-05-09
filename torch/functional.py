@@ -1,96 +1,126 @@
 import torch
-from ._utils import _range
 from operator import mul
 from functools import reduce
+import math
 
 __all__ = [
-    'split', 'chunk', 'stack', 'unbind', 'btriunpack', 'matmul',
+    'argmax',
+    'argmin',
+    'bartlett_window',
+    'btrifact',
+    'btriunpack',
+    'hamming_window',
+    'hann_window',
+    'isnan',
+    'split',
+    'unbind',
+    'unique',
 ]
 
 
-def split(tensor, split_size, dim=0):
-    """Splits the tensor into equally sized chunks (if possible).
+def split(tensor, split_size_or_sections, dim=0):
+    r"""Splits the tensor into chunks.
 
-    Last chunk will be smaller if the tensor size along a given dimension
-    is not divisible by ``split_size``.
+    If :attr:`split_size_or_sections` is an integer type, then :attr:`tensor` will
+    be split into equally sized chunks (if possible). Last chunk will be smaller if
+    the tensor size along the given dimension :attr:`dim= is not divisible by
+    :attr:`split_size`.
 
-    Arguments:
-        tensor (Tensor): tensor to split.
-        split_size (int): size of a single chunk.
-        dim (int): dimension along which to split the tensor.
-    """
-    if dim < 0:
-        dim += tensor.dim()
-    dim_size = tensor.size(dim)
-    num_splits = (dim_size + split_size - 1) // split_size
-    last_split_size = split_size - (split_size * num_splits - dim_size)
-
-    def get_split_size(i):
-        return split_size if i < num_splits - 1 else last_split_size
-    return tuple(tensor.narrow(int(dim), int(i * split_size), int(get_split_size(i))) for i
-                 in _range(0, num_splits))
-
-
-def chunk(tensor, chunks, dim=0):
-    """Splits a tensor into a number of chunks along a given dimension.
+    If :attr:`split_size_or_sections` is a list, then :attr:`tensor` will be split
+    into ``len(split_size_or_sections)`` chunks with sizes in :attr:`dim` according
+    to :attr:`split_size_or_sections`.
 
     Arguments:
         tensor (Tensor): tensor to split.
-        chunks (int): number of chunks to return.
+        split_size_or_sections (int) or (list(int)): size of a single chunk or
+        list of sizes for each chunk
         dim (int): dimension along which to split the tensor.
     """
-    if dim < 0:
-        dim += tensor.dim()
-    split_size = (tensor.size(dim) + chunks - 1) // chunks
-    return split(tensor, split_size, dim)
+    # Overwriting reason:
+    # This dispatches to two ATen functions depending on the type of
+    # split_size_or_sections. The branching code is in tensor.py, which we
+    # call here.
+    return tensor.split(split_size_or_sections, dim)
 
 
-def stack(sequence, dim=0, out=None):
-    """Concatenates sequence of tensors along a new dimension.
+def btrifact(A, info=None, pivot=True):
+    r"""Batch LU factorization.
 
-    All tensors need to be of the same size.
+    Returns a tuple containing the LU factorization and pivots. Pivoting is done if
+    :attr:`pivot` is set.
+
+    The optional argument :attr:`info` stores information if the factorization
+    succeeded for each minibatch example. The :attr:`info` is provided as an
+    `IntTensor`, its values will be filled from dgetrf and a non-zero value
+    indicates an error occurred. Specifically, the values are from cublas if cuda is
+    being used, otherwise LAPACK.
+
+    .. warning::
+        The :attr:`info` argument is deprecated in favor of :meth:`torch.btrifact_with_info`.
 
     Arguments:
-        sequence (Sequence): sequence of tensors to concatenate.
-        dim (int): dimension to insert. Has to be between 0 and the number
-            of dimensions of concatenated tensors (inclusive).
+        A (Tensor): the tensor to factor
+        info (IntTensor, optional): (deprecated) an `IntTensor` to store values
+            indicating whether factorization succeeds
+        pivot (bool, optional): controls whether pivoting is done
+
+    Returns:
+        A tuple containing factorization and pivots.
+
+    Example::
+
+        >>> A = torch.randn(2, 3, 3)
+        >>> A_LU, pivots = torch.btrifact(A)
+        >>> A_LU
+        tensor([[[ 1.3506,  2.5558, -0.0816],
+                 [ 0.1684,  1.1551,  0.1940],
+                 [ 0.1193,  0.6189, -0.5497]],
+
+                [[ 0.4526,  1.2526, -0.3285],
+                 [-0.7988,  0.7175, -0.9701],
+                 [ 0.2634, -0.9255, -0.3459]]])
+
+        >>> pivots
+        tensor([[ 3,  3,  3],
+                [ 3,  3,  3]], dtype=torch.int32)
     """
-    if len(sequence) == 0:
-        raise ValueError("stack expects a non-empty sequence of tensors")
-    if dim < 0:
-        dim += sequence[0].dim()
-    inputs = [t.unsqueeze(dim) for t in sequence]
-    if out is None:
-        return torch.cat(inputs, dim)
-    else:
-        return torch.cat(inputs, dim, out=out)
+    # Overwriting reason:
+    # `info` is being deprecated in favor of `btrifact_with_info`. This warning
+    # is in tensor.py, which we call here.
+    return A.btrifact(info, pivot)
 
 
 def unbind(tensor, dim=0):
-    """Removes a tensor dimension.
+    r"""Removes a tensor dimension.
 
     Returns a tuple of all slices along a given dimension, already without it.
 
     Arguments:
-        tensor (Tensor): tensor to unbind.
-        dim (int): dimension to remove.
+        tensor (Tensor): the tensor to unbind
+        dim (int): dimension to remove
     """
-    return tuple(tensor.select(dim, i) for i in _range(tensor.size(dim)))
+    return tuple(tensor.select(dim, i) for i in range(tensor.size(dim)))
 
 
 def btriunpack(LU_data, LU_pivots, unpack_data=True, unpack_pivots=True):
-    """Unpacks the data and pivots from a batched LU factorization (btrifact) of a tensor.
+    r"""Unpacks the data and pivots from a batched LU factorization (btrifact) of a tensor.
 
-    Returns a tuple indexed by:
-      0: The pivots.
-      1: The L tensor.
-      2: The U tensor.
+    Returns a tuple of tensors as ``(the pivots, the L tensor, the U tensor)``.
 
     Arguments:
-        LU_data (Tensor): The packed LU factorization data.
-        LU_pivots (Tensor): The packed LU factorization pivots.
-        unpack_data (bool): Flag indicating if the data should be unpacked.
-        unpack_pivots (bool): Flag indicating if the pivots should be unpacked.
+        LU_data (Tensor): the packed LU factorization data
+        LU_pivots (Tensor): the packed LU factorization pivots
+        unpack_data (bool): flag indicating if the data should be unpacked
+        unpack_pivots (bool): flag indicating if the pivots should be unpacked
+
+    Example::
+
+        >>> A = torch.randn(2, 3, 3)
+        >>> A_LU, pivots = A.btrifact()
+        >>> P, A_L, A_U = torch.btriunpack(A_LU, pivots)
+        >>>
+        >>> # can recover A from factorization
+        >>> A_ = torch.bmm(P, torch.bmm(A_L, A_U))
     """
 
     nBatch, sz, _ = LU_data.size()
@@ -111,7 +141,7 @@ def btriunpack(LU_data, LU_pivots, unpack_data=True, unpack_pivots=True):
         P = torch.eye(sz).type_as(LU_data).unsqueeze(0).repeat(nBatch, 1, 1)
         for i in range(nBatch):
             for j in range(sz):
-                k = LU_pivots[i, j] - 1
+                k = int(LU_pivots[i, j] - 1)
                 t = P[i, :, j].clone()
                 P[i, :, j] = P[i, :, k]
                 P[i, :, k] = t
@@ -121,99 +151,276 @@ def btriunpack(LU_data, LU_pivots, unpack_data=True, unpack_pivots=True):
     return P, L, U
 
 
-def matmul(tensor1, tensor2, out=None):
-    """Matrix product of two tensors.
+def hann_window(window_length, periodic=True, dtype=torch.float32):
+    r"""Hann window function.
 
-    The behavior depends on the dimensionality of the tensors as follows:
+    This method computes the Hann window function:
 
-    - If both tensors are 1-dimensional, the dot product (scalar) is returned.
-    - If both arguments are 2-dimensional, the matrix-matrix product is returned.
-    - If the first argument is 1-dimensional and the second argument is 2-dimensional,
-      a 1 is prepended to its dimension for the purpose of the matrix multiply.
-      After the matrix multiply, the prepended dimension is removed.
-    - If the first argument is 2-dimensional and the second argument is 1-dimensional,
-      the matrix-vector product is returned.
-    - If both arguments are at least 1-dimensional and at least one argument is
-      N-dimensional (where N > 2), then a batched matrix multiply is returned.  If the first
-      argument is 1-dimensional, a 1 is prepended to its dimension for the purpose of the
-      batched matrix multiply and removed after.  If the second argument is 1-dimensional, a
-      1 is appended to its dimension for the purpose of the batched matrix multiple and removed after.
-      The non-matrix (i.e. batch) dimensions are :ref:`broadcasted <broadcasting-semantics>` (and thus
-      must be broadcastable).  For example, if :attr:`tensor1` is a `j x 1 x n x m` Tensor
-      and :attr:`tensor2` is a `k x m x p` Tensor, :attr:`out` will be an `j x k x n x p` Tensor.
+    .. math::
+        w[n] = \frac{1}{2}\ \left[1 - \cos \left( \frac{2 \pi n}{N - 1} \right)\right] =
+                \sin^2 \left( \frac{\pi n}{N - 1} \right),
+
+    where :math:`N` is the full window size.
+
+    The input :attr:`window_length` is a positive integer controlling the
+    returned window size. :attr:`periodic` flag determines whether the returned
+    window trims off the last duplicate value from the symmetric window and is
+    ready to be used as a periodic window with functions like
+    :meth:`torch.stft`. Therefore, if :attr:`periodic` is true, the :math:`N` in
+    above formula is in fact :math:`\text{window_length} + 1`. Also, we always have
+    ``torch.hann_window(L, periodic=True)`` equal to
+    ``torch.hann_window(L + 1, periodic=False)[:-1])``.
 
     .. note::
-
-        The 1-dimensional dot product version of this function does not support an :attr:`out` parameter.
+        If :attr:`window_length` :math:`=1`, the returned window contains a single value 1.
 
     Arguments:
-        tensor1 (Tensor): First tensor to be multiplied
-        tensor2 (Tensor): Second tensor to be multiplied
-        out (Tensor, optional): Output tensor
+        window_length (int): the size of returned window
+        periodic (bool, optional): If True, returns a window to be used as periodic
+            function. If False, return a symmetric window.
+        dtype (:class:`torch.dtype`, optional): the desired type of returned window.
+            Default: `torch.float32`
+
+    Returns:
+        Tensor: A 1-D tensor of size :math:`(\text{window_length},)` containing the window
     """
-    dim_tensor1 = tensor1.dim()
-    dim_tensor2 = tensor2.dim()
-    if dim_tensor1 == 1 and dim_tensor2 == 1:
-        if out is None:
-            return torch.dot(tensor1, tensor2)
-        else:
-            raise ValueError("out must be None for 1-d tensor matmul, returns a scalar")
-    if dim_tensor1 == 2 and dim_tensor2 == 1:
-        if out is None:
-            return torch.mv(tensor1, tensor2)
-        else:
-            return torch.mv(tensor1, tensor2, out=out)
-    elif dim_tensor1 == 1 and dim_tensor2 == 2:
-        if out is None:
-            return torch.mm(tensor1.unsqueeze(0), tensor2).squeeze_(0)
-        else:
-            return torch.mm(tensor1.unsqueeze(0), tensor2, out=out).squeeze_(0)
-    elif dim_tensor1 == 2 and dim_tensor2 == 2:
-        if out is None:
-            return torch.mm(tensor1, tensor2)
-        else:
-            return torch.mm(tensor1, tensor2, out=out)
-    elif (dim_tensor1 >= 1 and dim_tensor2 >= 1) and (dim_tensor1 >= 3 or dim_tensor2 >= 3):
-        # ensure each tensor size is at least 3-dimensional
-        tensor1_exp_size = torch.Size((1,) * max(3 - tensor1.dim(), 0) + tensor1.size())
-        # rhs needs to be a separate case since we can't freely expand 1s on the rhs, but can on lhs
-        if dim_tensor2 == 1:
-            tensor2 = tensor2.unsqueeze(1)
-        tensor2_exp_size = torch.Size((1,) * max(3 - tensor2.dim(), 0) + tensor2.size())
+    if not dtype.is_floating_point:
+        raise ValueError("dtype must be a floating point type, but got dtype={}".format(dtype))
+    if window_length <= 0:
+        raise ValueError('window_length must be positive')
+    return hamming_window(window_length, periodic=periodic, alpha=0.5, beta=0.5, dtype=dtype)
 
-        # expand the batch portion (i.e. cut off matrix dimensions and expand rest)
-        expand_batch_portion = torch._C._infer_size(tensor1_exp_size[:-2], tensor2_exp_size[:-2])
 
-        # flatten expanded batches
-        tensor1_expanded = tensor1.expand(*(expand_batch_portion + tensor1_exp_size[-2:])) \
-            .contiguous().view(reduce(mul, expand_batch_portion), *tensor1_exp_size[-2:])
-        tensor2_expanded = tensor2.expand(*(expand_batch_portion + tensor2_exp_size[-2:])) \
-            .contiguous().view(reduce(mul, expand_batch_portion), *tensor2_exp_size[-2:])
+def hamming_window(window_length, periodic=True, alpha=0.54, beta=0.46, dtype=torch.float32):
+    r"""Hamming window function.
 
-        # reshape batches back into result
-        total_expansion = expand_batch_portion + (tensor1_exp_size[-2], tensor2_exp_size[-1])
+    This method computes the Hamming window function:
 
-        def maybeSqueeze(tensor):
-            if dim_tensor1 == 1:
-                return tensor.squeeze_(-2)
-            elif dim_tensor2 == 1:
-                return tensor.squeeze_(-1)
-            else:
-                return tensor
+    .. math::
+        w[n] = \alpha - \beta\ \cos \left( \frac{2 \pi n}{N - 1} \right),
 
-        if out is None:
-            return maybeSqueeze(torch.bmm(tensor1_expanded, tensor2_expanded).view(*(total_expansion)))
-        else:
-            # We can only safely reshape the output if the output (after the torch.bmm call)
-            # is contiguous.  This will happen only if:
-            # 1) We force it to be contiguous
-            # 2) The output came in as contiguous
-            # 3) The output came in as the wrong size (so was resized in the torch.bmm call).
-            #
-            # Even though 1) is inconsistent with other functions (e.g. torch.bmm) that will maintain
-            # output non-contiguity if the size is correct, we'll do it here for simplicity.
-            out = out.contiguous()
-            return (torch.bmm(tensor1_expanded, tensor2_expanded, out=out).
-                    set_(maybeSqueeze(out.view(*(total_expansion)))))
-    raise ValueError("both arguments to __matmul__ need to be at least 1D, "
-                     "but they are {}D and {}D".format(dim_tensor1, dim_tensor2))
+    where :math:`N` is the full window size.
+
+    The input :attr:`window_length` is a positive integer controlling the
+    returned window size. :attr:`periodic` flag determines whether the returned
+    window trims off the last duplicate value from the symmetric window and is
+    ready to be used as a periodic window with functions like
+    :meth:`torch.stft`. Therefore, if :attr:`periodic` is true, the :math:`N` in
+    above formula is in fact :math:`\text{window_length} + 1`. Also, we always have
+    ``torch.hamming_window(L, periodic=True)`` equal to
+    ``torch.hamming_window(L + 1, periodic=False)[:-1])``.
+
+    .. note::
+        If :attr:`window_length` :math:`=1`, the returned window contains a single value 1.
+
+    .. note::
+        This is a generalized version of :meth:`torch.hann_window`.
+
+    Arguments:
+        window_length (int): the size of returned window
+        periodic (bool, optional): If True, returns a window to be used as periodic
+            function. If False, return a symmetric window.
+        dtype (:class:`torch.dtype`, optional): the desired type of returned window.
+            Default: `torch.float32`
+
+    Returns:
+        Tensor: A 1-D tensor of size :math:`(\text{window_length},)` containing the window
+    """
+    if not dtype.is_floating_point:
+        raise ValueError("dtype must be a floating point type, but got dtype={}".format(dtype))
+    if window_length <= 0:
+        raise ValueError('window_length must be positive')
+    if window_length == 1:
+        return torch.ones(window_length, dtype=dtype)
+    window_length += int(periodic)
+    window = torch.arange(window_length, dtype=dtype)
+    window = window.mul_(math.pi * 2 / (window_length - 1)).cos_().mul_(-beta).add_(alpha)
+    if periodic:
+        return window[:-1]
+    else:
+        return window
+
+
+def bartlett_window(window_length, periodic=True, dtype=torch.float32):
+    r"""Bartlett window function.
+
+    This method computes the Bartlett window function:
+
+    .. math::
+        w[n] = 1 - \left| \frac{2n}{N-1} - 1 \right| = \begin{cases}
+            \frac{2n}{N - 1} & \text{if } 0 \leq n \leq \frac{N - 1}{2} \\
+            2 - \frac{2n}{N - 1} & \text{if } \frac{N - 1}{2} < n < N \\
+        \end{cases},
+
+    where :math:`N` is the full window size.
+
+    The input :attr:`window_length` is a positive integer controlling the
+    returned window size. :attr:`periodic` flag determines whether the returned
+    window trims off the last duplicate value from the symmetric window and is
+    ready to be used as a periodic window with functions like
+    :meth:`torch.stft`. Therefore, if :attr:`periodic` is true, the :math:`N` in
+    above formula is in fact :math:`\text{window_length} + 1`. Also, we always have
+    ``torch.bartlett_window(L, periodic=True)`` equal to
+    ``torch.bartlett_window(L + 1, periodic=False)[:-1])``.
+
+    .. note::
+        If :attr:`window_length` :math:`=1`, the returned window contains a single value 1.
+
+    Arguments:
+        window_length (int): the size of returned window
+        periodic (bool, optional): If True, returns a window to be used as periodic
+            function. If False, return a symmetric window.
+        dtype (:class:`torch.dtype`, optional): the desired type of returned window.
+            Default: `torch.float32`
+
+    Returns:
+        Tensor: A 1-D tensor of size :math:`(\text{window_length},)` containing the window
+    """
+    if not dtype.is_floating_point:
+        raise ValueError("dtype must be a floating point type, but got dtype={}".format(dtype))
+    if window_length <= 0:
+        raise ValueError('window_length must be positive')
+    if window_length == 1:
+        return torch.ones(window_length, dtype=dtype)
+    window_length += int(periodic)
+    window = torch.arange(window_length, dtype=dtype).mul_(2.0 / (window_length - 1))
+    first_half_size = ((window_length - 1) >> 1) + 1
+    window.narrow(0, first_half_size, window_length - first_half_size).mul_(-1).add_(2)
+    if periodic:
+        return window[:-1]
+    else:
+        return window
+
+
+def isnan(tensor):
+    r"""Returns a new tensor with boolean elements representing if each element is `NaN` or not.
+
+    Arguments:
+        tensor (Tensor): A tensor to check
+
+    Returns:
+        Tensor: A ``torch.ByteTensor`` containing a 1 at each location of `NaN` elements.
+
+    Example::
+
+        >>> torch.isnan(torch.tensor([1, float('nan'), 2]))
+        tensor([ 0,  1,  0], dtype=torch.uint8)
+    """
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError("The argument is not a tensor")
+    return tensor != tensor
+
+
+def unique(input, sorted=False, return_inverse=False):
+    r"""Returns the unique scalar elements of the input tensor as a 1-D tensor.
+
+    Arguments:
+        input (Tensor): the input tensor
+        sorted (bool): Whether to sort the unique elements in ascending order
+            before returning as output.
+        return_inverse (bool): Whether to also return the indices for where
+            elements in the original input ended up in the returned unique list.
+
+    Returns:
+        (Tensor, Tensor (optional)): A tensor or a tuple of tensors containing
+
+            - **output** (*Tensor*): the output list of unique scalar elements.
+            - **inverse_indices** (*Tensor*): (optional) if
+              :attr:`return_inverse` is True, there will be a
+              2nd returned tensor (same shape as input) representing the indices
+              for where elements in the original input map to in the output;
+              otherwise, this function will only return a single tensor.
+
+    Example::
+
+        >>> output = torch.unique(torch.tensor([1, 3, 2, 3], dtype=torch.long))
+        >>> output
+        tensor([ 2,  3,  1])
+
+        >>> output, inverse_indices = torch.unique(
+                torch.tensor([1, 3, 2, 3], dtype=torch.long), sorted=True, return_inverse=True)
+        >>> output
+        tensor([ 1,  2,  3])
+        >>> inverse_indices
+        tensor([ 0,  2,  1,  2])
+
+        >>> output, inverse_indices = torch.unique(
+                torch.tensor([[1, 3], [2, 3]], dtype=torch.long), sorted=True, return_inverse=True)
+        >>> output
+        tensor([ 1,  2,  3])
+        >>> inverse_indices
+        tensor([[ 0,  2],
+                [ 1,  2]])
+
+    """
+    output, inverse_indices = torch._unique(
+        input,
+        sorted=sorted,
+        return_inverse=return_inverse,
+    )
+    if return_inverse:
+        return output, inverse_indices
+    else:
+        return output
+
+
+def argmax(input, dim=None, keepdim=False):
+    """Returns the indices of the maximum values of a tensor across a dimension.
+
+    This is the second value returned by :meth:`torch.max`. See its
+    documentation for the exact semantics of this method.
+
+    Args:
+        input (Tensor): the input tensor
+        dim (int): the dimension to reduce. If ``None``, the argmax of the
+            flattened input is returned.
+        keepdim (bool): whether the output tensors have :attr:`dim`
+            retained or not. Ignored if ``dim=None``.
+
+    Example::
+
+        >>> a = torch.randn(4, 4)
+        >>> a
+        tensor([[ 1.3398,  0.2663, -0.2686,  0.2450],
+                [-0.7401, -0.8805, -0.3402, -1.1936],
+                [ 0.4907, -1.3948, -1.0691, -0.3132],
+                [-1.6092,  0.5419, -0.2993,  0.3195]])
+
+
+        >>> torch.argmax(a, dim=1)
+        tensor([ 0,  2,  0,  1])
+    """
+    if dim is None:
+        return torch._argmax(input.contiguous().view(-1), dim=0, keepdim=False)
+    return torch._argmax(input, dim, keepdim)
+
+
+def argmin(input, dim=None, keepdim=False):
+    """Returns the indices of the minimum values of a tensor across a dimension.
+
+    This is the second value returned by :meth:`torch.min`. See its
+    documentation for the exact semantics of this method.
+
+    Args:
+        input (Tensor): the input tensor
+        dim (int): the dimension to reduce. If ``None``, the argmin of the
+            flattened input is returned.
+        keepdim (bool): whether the output tensors have :attr:`dim`
+            retained or not. Ignored if ``dim=None``.
+
+    Example::
+
+        >>> a = torch.randn(4, 4)
+        >>> a
+        tensor([[ 0.1139,  0.2254, -0.1381,  0.3687],
+                [ 1.0100, -1.1975, -0.0102, -0.4732],
+                [-0.9240,  0.1207, -0.7506, -1.0213],
+                [ 1.7809, -1.2960,  0.9384,  0.1438]])
+
+
+        >>> torch.argmin(a, dim=1)
+        tensor([ 2,  1,  3,  1])
+    """
+    if dim is None:
+        return torch._argmin(input.contiguous().view(-1), dim=0, keepdim=False)
+    return torch._argmin(input, dim, keepdim)

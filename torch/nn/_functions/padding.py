@@ -1,72 +1,75 @@
-from torch.autograd import Function
+from torch.autograd import Function, Variable
+from torch.autograd._functions.utils import prepare_onnx_paddings
 
 
-class ConstantPad2d(Function):
+class ConstantPadNd(Function):
 
-    def __init__(self, pad, value=0):
-        super(ConstantPad2d, self).__init__()
-        self.pad = pad
-        self.value = value
+    @staticmethod
+    def symbolic(g, input, pad, value=0):
+        paddings = prepare_onnx_paddings(len(input.type().sizes()), pad)
+        return g.op("Pad", input, pads_i=paddings, mode_s="constant", value_f=value)
 
-    def forward(self, input):
-        assert input.dim() == 4, 'only 4D supported for padding'
-        pad_l, pad_r, pad_t, pad_b = self.pad
-        h = input.size(2) + pad_t + pad_b
-        w = input.size(3) + pad_l + pad_r
-        assert w > 0 and h > 0, 'input is too small'
+    @staticmethod
+    def forward(ctx, input, pad, value=0):
+        ctx.pad = pad
+        ctx.value = value
+        ctx.input_size = input.size()
+        ctx.l_inp = len(input.size())
+        ctx.pad_tup = tuple([(a, b) for a, b in zip(pad[:-1:2], pad[1::2])][::-1])
+        ctx.l_pad = len(ctx.pad_tup)
+        ctx.l_diff = ctx.l_inp - ctx.l_pad
+        assert ctx.l_inp >= ctx.l_pad
 
-        self.input_size = input.size()
+        new_dim = tuple([sum((d,) + ctx.pad_tup[i]) for i, d in enumerate(input.size()[-ctx.l_pad:])])
+        assert all([d > 0 for d in new_dim]), 'input is too small'
 
         # crop input if necessary
-        output = input.new(input.size(0), input.size(1), h, w).fill_(self.value)
+        output = input.new(input.size()[:(ctx.l_diff)] + new_dim).fill_(ctx.value)
         c_input = input
-        if pad_t < 0:
-            c_input = c_input.narrow(2, -pad_t, c_input.size(2) + pad_t)
-        if pad_b < 0:
-            c_input = c_input.narrow(2, 0, c_input.size(2) + pad_b)
-        if pad_l < 0:
-            c_input = c_input.narrow(3, -pad_l, c_input.size(3) + pad_l)
-        if pad_r < 0:
-            c_input = c_input.narrow(3, 0, c_input.size(3) + pad_r)
+
+        for i, p in zip(range(ctx.l_inp)[-ctx.l_pad:], ctx.pad_tup):
+            if p[0] < 0:
+                c_input = c_input.narrow(i, -p[0], c_input.size(i) + p[0])
+            if p[1] < 0:
+                c_input = c_input.narrow(i, 0, c_input.size(i) + p[1])
 
         # crop output if necessary
         c_output = output
-        if pad_t > 0:
-            c_output = c_output.narrow(2, pad_t, c_output.size(2) - pad_t)
-        if pad_b > 0:
-            c_output = c_output.narrow(2, 0, c_output.size(2) - pad_b)
-        if pad_l > 0:
-            c_output = c_output.narrow(3, pad_l, c_output.size(3) - pad_l)
-        if pad_r > 0:
-            c_output = c_output.narrow(3, 0, c_output.size(3) - pad_r)
+        for i, p in zip(range(ctx.l_inp)[-ctx.l_pad:], ctx.pad_tup):
+            if p[0] > 0:
+                c_output = c_output.narrow(i, p[0], c_output.size(i) - p[0])
+            if p[1] > 0:
+                c_output = c_output.narrow(i, 0, c_output.size(i) - p[1])
         c_output.copy_(c_input)
         return output
 
-    def backward(self, grad_output):
-        pad_l, pad_r, pad_t, pad_b = self.pad
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = Variable(grad_output.data.new(ctx.input_size).zero_())
+        grad_input_slices = [slice(0, x,) for x in ctx.input_size]
 
-        grad_input = grad_output.new(self.input_size).zero_()
+        def narrow_slice(dim, start, length):
+            grad_input_slices[dim] = (slice(grad_input_slices[dim].start + start,
+                                            grad_input_slices[dim].start + start + length))
+
+        def slice_length(dim):
+            return grad_input_slices[dim].stop - grad_input_slices[dim].start
 
         #  crop grad_input if necessary
-        cg_input = grad_input
-        if pad_t < 0:
-            cg_input = cg_input.narrow(2, -pad_t, cg_input.size(2) + pad_t)
-        if pad_b < 0:
-            cg_input = cg_input.narrow(2, 0, cg_input.size(2) + pad_b)
-        if pad_l < 0:
-            cg_input = cg_input.narrow(3, -pad_l, cg_input.size(3) + pad_l)
-        if pad_r < 0:
-            cg_input = cg_input.narrow(3, 0, cg_input.size(3) + pad_r)
+        for i, p in zip(range(ctx.l_inp)[-ctx.l_pad:], ctx.pad_tup):
+            if p[0] < 0:
+                narrow_slice(i, -p[0], slice_length(i) + p[0])
+            if p[1] < 0:
+                narrow_slice(i, 0, slice_length(i) + p[1])
 
         # crop grad_output if necessary
         cg_output = grad_output
-        if pad_t > 0:
-            cg_output = cg_output.narrow(2, pad_t, cg_output.size(2) - pad_t)
-        if pad_b > 0:
-            cg_output = cg_output.narrow(2, 0, cg_output.size(2) - pad_b)
-        if pad_l > 0:
-            cg_output = cg_output.narrow(3, pad_l, cg_output.size(3) - pad_l)
-        if pad_r > 0:
-            cg_output = cg_output.narrow(3, 0, cg_output.size(3) - pad_r)
-        cg_input.copy_(cg_output)
-        return grad_input
+        for i_s, p in zip(range(ctx.l_inp)[-ctx.l_pad:], ctx.pad_tup):
+            if p[0] > 0:
+                cg_output = cg_output.narrow(i_s, p[0], cg_output.size(i_s) - p[0])
+            if p[1] > 0:
+                cg_output = cg_output.narrow(i_s, 0, cg_output.size(i_s) - p[1])
+        gis = tuple(grad_input_slices)
+        grad_input[gis] = cg_output
+
+        return grad_input, None, None

@@ -1,4 +1,6 @@
+import math
 from bisect import bisect_right
+from functools import partial
 from .optimizer import Optimizer
 
 
@@ -20,6 +22,29 @@ class _LRScheduler(object):
         self.step(last_epoch + 1)
         self.last_epoch = last_epoch
 
+    def __getstate__(self):
+        return self.state_dict()
+
+    def __setstate__(self, state):
+        self.load_state_dict(state)
+
+    def state_dict(self):
+        """Returns the state of the scheduler as a :class:`dict`.
+
+        It contains an entry for every variable in self.__dict__ which
+        is not the optimizer.
+        """
+        return {key: value for key, value in self.__dict__.items() if key != 'optimizer'}
+
+    def load_state_dict(self, state_dict):
+        """Loads the schedulers state.
+
+        Arguments:
+            state_dict (dict): scheduler state. Should be an object returned
+                from a call to :meth:`state_dict`.
+        """
+        self.__dict__.update(state_dict)
+
     def get_lr(self):
         raise NotImplementedError
 
@@ -38,8 +63,8 @@ class LambdaLR(_LRScheduler):
     Args:
         optimizer (Optimizer): Wrapped optimizer.
         lr_lambda (function or list): A function which computes a multiplicative
-            factor given an integer parameter epoch, or a list of such functions,
-            one for each group in optimizer.param_groups.
+            factor given an integer parameter epoch, or a list of such
+            functions, one for each group in optimizer.param_groups.
         last_epoch (int): The index of last epoch. Default: -1.
 
     Example:
@@ -52,6 +77,7 @@ class LambdaLR(_LRScheduler):
         >>>     train(...)
         >>>     validate(...)
     """
+
     def __init__(self, optimizer, lr_lambda, last_epoch=-1):
         self.optimizer = optimizer
         if not isinstance(lr_lambda, list) and not isinstance(lr_lambda, tuple):
@@ -78,11 +104,11 @@ class StepLR(_LRScheduler):
         optimizer (Optimizer): Wrapped optimizer.
         step_size (int): Period of learning rate decay.
         gamma (float): Multiplicative factor of learning rate decay.
-            Default: -0.1.
+            Default: 0.1.
         last_epoch (int): The index of last epoch. Default: -1.
 
     Example:
-        >>> # Assuming optimizer uses lr = 0.5 for all groups
+        >>> # Assuming optimizer uses lr = 0.05 for all groups
         >>> # lr = 0.05     if epoch < 30
         >>> # lr = 0.005    if 30 <= epoch < 60
         >>> # lr = 0.0005   if 60 <= epoch < 90
@@ -113,11 +139,11 @@ class MultiStepLR(_LRScheduler):
         optimizer (Optimizer): Wrapped optimizer.
         milestones (list): List of epoch indices. Must be increasing.
         gamma (float): Multiplicative factor of learning rate decay.
-            Default: -0.1.
+            Default: 0.1.
         last_epoch (int): The index of last epoch. Default: -1.
 
     Example:
-        >>> # Assuming optimizer uses lr = 0.5 for all groups
+        >>> # Assuming optimizer uses lr = 0.05 for all groups
         >>> # lr = 0.05     if epoch < 30
         >>> # lr = 0.005    if 30 <= epoch < 80
         >>> # lr = 0.0005   if epoch >= 80
@@ -160,6 +186,43 @@ class ExponentialLR(_LRScheduler):
                 for base_lr in self.base_lrs]
 
 
+class CosineAnnealingLR(_LRScheduler):
+    r"""Set the learning rate of each parameter group using a cosine annealing
+    schedule, where :math:`\eta_{max}` is set to the initial lr and
+    :math:`T_{cur}` is the number of epochs since the last restart in SGDR:
+
+    .. math::
+
+        \eta_t = \eta_{min} + \frac{1}{2}(\eta_{max} - \eta_{min})(1 +
+        \cos(\frac{T_{cur}}{T_{max}}\pi))
+
+    When last_epoch=-1, sets initial lr as lr.
+
+    It has been proposed in
+    `SGDR: Stochastic Gradient Descent with Warm Restarts`_. Note that this only
+    implements the cosine annealing part of SGDR, and not the restarts.
+
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        T_max (int): Maximum number of iterations.
+        eta_min (float): Minimum learning rate. Default: 0.
+        last_epoch (int): The index of last epoch. Default: -1.
+
+    .. _SGDR\: Stochastic Gradient Descent with Warm Restarts:
+        https://arxiv.org/abs/1608.03983
+    """
+
+    def __init__(self, optimizer, T_max, eta_min=0, last_epoch=-1):
+        self.T_max = T_max
+        self.eta_min = eta_min
+        super(CosineAnnealingLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        return [self.eta_min + (base_lr - self.eta_min) *
+                (1 + math.cos(math.pi * self.last_epoch / self.T_max)) / 2
+                for base_lr in self.base_lrs]
+
+
 class ReduceLROnPlateau(object):
     """Reduce learning rate when a metric has stopped improving.
     Models often benefit from reducing the learning rate by a factor
@@ -176,9 +239,13 @@ class ReduceLROnPlateau(object):
         factor (float): Factor by which the learning rate will be
             reduced. new_lr = lr * factor. Default: 0.1.
         patience (int): Number of epochs with no improvement after
-            which learning rate will be reduced. Default: 10.
-        verbose (bool): If True, prints a message to stdout for
-            each update. Default: False.
+            which learning rate will be reduced. For example, if
+            `patience = 2`, then we will ignore the first 2 epochs
+            with no improvement, and will only decrease the LR after the
+            3rd epoch if the loss still hasn't improved then.
+            Default: 10.
+        verbose (bool): If ``True``, prints a message to stdout for
+            each update. Default: ``False``.
         threshold (float): Threshold for measuring the new optimum,
             to only focus on significant changes. Default: 1e-4.
         threshold_mode (str): One of `rel`, `abs`. In `rel` mode,
@@ -197,7 +264,7 @@ class ReduceLROnPlateau(object):
 
     Example:
         >>> optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
-        >>> scheduler = torch.optim.ReduceLROnPlateau(optimizer, 'min')
+        >>> scheduler = ReduceLROnPlateau(optimizer, 'min')
         >>> for epoch in range(10):
         >>>     train(...)
         >>>     val_loss = validate(...)
@@ -284,22 +351,30 @@ class ReduceLROnPlateau(object):
     def in_cooldown(self):
         return self.cooldown_counter > 0
 
+    def _cmp(self, mode, threshold_mode, threshold, a, best):
+        if mode == 'min' and threshold_mode == 'rel':
+            rel_epsilon = 1. - threshold
+            return a < best * rel_epsilon
+
+        elif mode == 'min' and threshold_mode == 'abs':
+            return a < best - threshold
+
+        elif mode == 'max' and threshold_mode == 'rel':
+            rel_epsilon = threshold + 1.
+            return a > best * rel_epsilon
+
+        else:  # mode == 'max' and epsilon_mode == 'abs':
+            return a > best + threshold
+
     def _init_is_better(self, mode, threshold, threshold_mode):
         if mode not in {'min', 'max'}:
             raise ValueError('mode ' + mode + ' is unknown!')
         if threshold_mode not in {'rel', 'abs'}:
-            raise ValueError('threshold mode ' + mode + ' is unknown!')
-        if mode == 'min' and threshold_mode == 'rel':
-            rel_epsilon = 1. - threshold
-            self.is_better = lambda a, best: a < best * rel_epsilon
-            self.mode_worse = float('Inf')
-        elif mode == 'min' and threshold_mode == 'abs':
-            self.is_better = lambda a, best: a < best - threshold
-            self.mode_worse = float('Inf')
-        elif mode == 'max' and threshold_mode == 'rel':
-            rel_epsilon = threshold + 1.
-            self.is_better = lambda a, best: a > best * rel_epsilon
-            self.mode_worse = -float('Inf')
-        else:  # mode == 'max' and epsilon_mode == 'abs':
-            self.is_better = lambda a, best: a > best + threshold
-            self.mode_worse = -float('Inf')
+            raise ValueError('threshold mode ' + threshold_mode + ' is unknown!')
+
+        if mode == 'min':
+            self.mode_worse = float('inf')
+        else:  # mode == 'max':
+            self.mode_worse = (-float('inf'))
+
+        self.is_better = partial(self._cmp, mode, threshold_mode, threshold)

@@ -1,26 +1,14 @@
 import ctypes
 import torch
-from . import cudart
-
-
-SUCCESS = 0
-ERROR_NOT_READY = 34
-
-
-class CudaError(RuntimeError):
-
-    def __init__(self, code):
-        msg = cudart().cudaGetErrorString(code).decode('utf-8')
-        super(CudaError, self).__init__('{0} ({1})'.format(msg, code))
-
-
-def check_error(res):
-    if res != SUCCESS:
-        raise CudaError(res)
+from . import cudart, check_error, cudaStatus
 
 
 class Stream(torch._C._CudaStreamBase):
     """Wrapper around a CUDA stream.
+
+    A CUDA stream is a linear sequence of execution that belongs to a specific
+    device, independent from other streams.  See :ref:`cuda-semantics` for
+    details.
 
     Arguments:
         device(int, optional): a device on which to allocate the Stream.
@@ -37,6 +25,15 @@ class Stream(torch._C._CudaStreamBase):
 
         Arguments:
             event (Event): an event to wait for.
+
+        .. note:: This is a wrapper around ``cudaStreamWaitEvent()``: see `CUDA
+           documentation`_ for more info.
+
+           This function returns without waiting for :attr:`event`: only future
+           operations are affected.
+
+        .. _CUDA documentation:
+           http://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html
         """
         check_error(cudart().cudaStreamWaitEvent(self, event, ctypes.c_int(0)))
 
@@ -48,6 +45,9 @@ class Stream(torch._C._CudaStreamBase):
 
         Arguments:
             stream (Stream): a stream to synchronize.
+
+        .. note:: This function returns without waiting for currently enqueued
+           kernels in :attr:`stream`: only future operations are affected.
         """
         self.wait_event(stream.record_event())
 
@@ -73,13 +73,20 @@ class Stream(torch._C._CudaStreamBase):
             A boolean indicating if all kernels in this stream are completed.
         """
         res = cudart().cudaStreamQuery(self)
-        if res == ERROR_NOT_READY:
+        if res == cudaStatus.ERROR_NOT_READY:
             return False
         check_error(res)
         return True
 
     def synchronize(self):
-        """Wait for all the kernels in this stream to complete."""
+        """Wait for all the kernels in this stream to complete.
+
+        .. note:: This is a wrapper around ``cudaStreamSynchronize()``: see
+           `CUDA documentation`_ for more info.
+
+        .. _CUDA documentation:
+           http://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html
+        """
         check_error(cudart().cudaStreamSynchronize(self))
 
     @staticmethod
@@ -123,10 +130,10 @@ class Event(object):
 
     Arguments:
         enable_timing (bool): indicates if the event should measure time
-            (default: False)
-        blocking (bool): if true, :meth:`wait` will be blocking (default: False)
-        interprocess (bool): if true, the event can be shared between processes
-            (default: False)
+            (default: ``False``)
+        blocking (bool): if ``True``, :meth:`wait` will be blocking (default: ``False``)
+        interprocess (bool): if ``True``, the event can be shared between processes
+            (default: ``False``)
     """
 
     DEFAULT = 0x0
@@ -176,7 +183,7 @@ class Event(object):
             A boolean indicating if the event has been recorded.
         """
         res = cudart().cudaEventQuery(self)
-        if res == ERROR_NOT_READY:
+        if res == cudaStatus.ERROR_NOT_READY:
             return False
         check_error(res)
         return True

@@ -42,6 +42,7 @@ TYPE_RECUR_FUNCTION = 8
 LEGACY_TYPE_RECUR_FUNCTION = 7
 
 
+import sys
 import struct
 from array import array
 from collections import namedtuple
@@ -218,9 +219,9 @@ def _load_backend(obj):
     # Try to find tensor attributes and infer type from them
     for key in dir(obj):
         attr = getattr(obj, key)
-        if torch.is_tensor(attr):
+        if isinstance(attr, torch.Tensor):
             try:
-                obj._backend = type2backend[type(attr)]
+                obj._backend = type2backend[attr.type()]
             except KeyError:
                 pass
     # Monkey patch the forward to capture the type of input
@@ -228,9 +229,9 @@ def _load_backend(obj):
 
     def updateOutput_patch(*args):
         input = args[0]
-        while not torch.is_tensor(input):
+        while not isinstance(input, torch.Tensor):
             input = input[0]
-        obj._backend = type2backend[type(input)]
+        obj._backend = type2backend[input.type()]
         obj.updateOutput = updateOutput_orig
         return obj.updateOutput(*args)
     obj.updateOutput = updateOutput_patch
@@ -297,9 +298,16 @@ def GradientReversal_reader(reader, version, obj):
         setattr(obj, 'lambda', 1)
 
 
+@custom_reader(nn.VolumetricAveragePooling)
+def VolumetricAveragePooling_reader(reader, version, obj):
+    obj.padT, obj.padH, obj.padW = 0, 0, 0
+    obj.ceil_mode = False
+    obj.count_include_pad = True
+
 ################################################################################
 # Functions for patching objects so that they work with legacy modules
 ################################################################################
+
 
 def registry_addon(fn):
     def wrapper_factory(module_name, *args, **kwargs):
@@ -481,7 +489,8 @@ class T7Reader:
                 lst.append(self.read_long())
             return lst
         else:
-            arr = array('l')
+            LONG_SIZE_ARR = 'q' if sys.version_info[0] == 3 else 'l'
+            arr = array(LONG_SIZE_ARR)
             arr.fromfile(self.f, n)
             return arr.tolist()
 
